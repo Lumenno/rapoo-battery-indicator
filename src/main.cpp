@@ -234,6 +234,106 @@ void CopyDiagnostics(HWND window) {
     if (memory) GlobalFree(memory);
 }
 
+COLORREF TaskbarTextColor() {
+    HIGHCONTRASTW contrast{sizeof(HIGHCONTRASTW), 0, nullptr};
+    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON)) return GetSysColor(COLOR_BTNTEXT);
+
+    DWORD light = 0;
+    DWORD size = sizeof(light);
+    RegGetValueW(HKEY_CURRENT_USER,
+                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+    return light ? RGB(0, 0, 0) : RGB(255, 255, 255);
+}
+
+HFONT CreateWidgetFont(HDC dc, int height) {
+    const auto create = [height](const wchar_t* name) {
+        return CreateFontW(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                           ANTIALIASED_QUALITY, DEFAULT_PITCH, name);
+    };
+    HFONT font = create(L"Segoe UI Variable Text");
+    if (font) {
+        const HGDIOBJ old = SelectObject(dc, font);
+        wchar_t face[LF_FACESIZE]{};
+        GetTextFaceW(dc, LF_FACESIZE, face);
+        SelectObject(dc, old);
+        if (wcsncmp(face, L"Segoe UI Variable", 17) == 0) return font;
+        DeleteObject(font);
+    }
+    return create(L"Segoe UI");
+}
+
+bool PaintWidget(int width, int height, UINT dpi, int value, bool stale, COLORREF color) {
+    const HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return false;
+    BITMAPINFO format{};
+    format.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    format.bmiHeader.biWidth = width;
+    format.bmiHeader.biHeight = -height;
+    format.bmiHeader.biPlanes = 1;
+    format.bmiHeader.biBitCount = 32;
+    format.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    const HBITMAP surface = CreateDIBSection(dc, &format, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!surface) {
+        DeleteDC(dc);
+        return false;
+    }
+    const HGDIOBJ oldBitmap = SelectObject(dc, surface);
+    PatBlt(dc, 0, 0, width, height, BLACKNESS);
+    const auto scale = [dpi](int pixels) { return std::max(1, MulDiv(pixels, dpi, 96)); };
+    const int left = scale(6);
+    const int mouseWidth = scale(12);
+    const int mouseHeight = std::min(height, scale(16));
+    const int top = (height - mouseHeight) / 2;
+    const HPEN pen = CreatePen(PS_SOLID, scale(1), RGB(255, 255, 255));
+    const HGDIOBJ oldPen = SelectObject(dc, pen);
+    const HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, left, top, left + mouseWidth, top + mouseHeight, scale(8), scale(8));
+    MoveToEx(dc, left + mouseWidth / 2, top + scale(3), nullptr);
+    LineTo(dc, left + mouseWidth / 2, top + mouseHeight / 2);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+
+    wchar_t label[8] = L"—";
+    if (value >= 0) std::swprintf(label, 8, L"%d%%", value % 101);
+    const HFONT font = CreateWidgetFont(dc, scale(12));
+    const HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    RECT text{left + mouseWidth + scale(5), 0, width, height};
+    DrawTextW(dc, label, -1, &text, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
+    GdiFlush();
+
+    // Convert the grayscale glyph mask to premultiplied BGRA. An alpha of 1
+    // in empty pixels lets the taskbar show through and keeps the menu clickable.
+    auto* pixels = static_cast<DWORD*>(bits);
+    const unsigned opacity = stale ? 180 : 255;
+    for (int index = 0; index < width * height; ++index) {
+        const unsigned coverage = pixels[index] & 0xFFU;
+        const unsigned alpha = std::max(1U, coverage * opacity / 255);
+        const unsigned red = GetRValue(color) * alpha / 255;
+        const unsigned green = GetGValue(color) * alpha / 255;
+        const unsigned blue = GetBValue(color) * alpha / 255;
+        pixels[index] = (alpha << 24) | (red << 16) | (green << 8) | blue;
+    }
+
+    SIZE size{width, height};
+    POINT origin{};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    const bool painted = UpdateLayeredWindow(widget, nullptr, nullptr, &size, dc, &origin,
+                                              0, &blend, ULW_ALPHA) != FALSE;
+    SelectObject(dc, oldBitmap);
+    DeleteObject(surface);
+    DeleteDC(dc);
+    return painted;
+}
+
 LRESULT CALLBACK WidgetProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
     if (message == WM_RBUTTONUP) {
@@ -243,7 +343,8 @@ LRESULT CALLBACK WidgetProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, displayed == Disconnected
                     ? L"Rapoo VT2 MAX — приёмник не найден" : displayed == Waiting
                     ? L"Rapoo VT2 MAX — ожидание данных" : displayedStale
-                    ? L"Rapoo VT2 MAX — последнее показание" : L"Rapoo VT2 MAX");
+                    ? L"Rapoo VT2 MAX — последнее показание" : displayed >= 101
+                    ? L"Rapoo VT2 MAX — заряжается" : L"Rapoo VT2 MAX");
         AppendMenuW(menu, MF_STRING, 1, L"Копировать диагностику");
         AppendMenuW(menu, MF_STRING, 2, L"Выход");
         SetForegroundWindow(window);
@@ -253,45 +354,6 @@ LRESULT CALLBACK WidgetProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         DestroyMenu(menu);
         if (command == 1) CopyDiagnostics(window);
         if (command == 2) PostQuitMessage(0);
-        return 0;
-    }
-    if (message == WM_PAINT) {
-        PAINTSTRUCT paint{};
-        const HDC dc = BeginPaint(window, &paint);
-        RECT area{};
-        GetClientRect(window, &area);
-        const int h = area.bottom;
-        const int mouseWidth = MulDiv(16, h, 30);
-        const int mouseHeight = MulDiv(22, h, 30);
-        const int left = MulDiv(6, h, 30);
-        const int top = (h - mouseHeight) / 2;
-        const COLORREF foreground = displayedStale ? RGB(174, 185, 199) : RGB(242, 247, 255);
-        HBRUSH background = CreateSolidBrush(RGB(29, 43, 61));
-        FillRect(dc, &area, background);
-        HPEN pen = CreatePen(PS_SOLID, std::max(1, h / 18), foreground);
-        HGDIOBJ oldPen = SelectObject(dc, pen);
-        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        RoundRect(dc, left, top, left + mouseWidth, top + mouseHeight, mouseWidth, mouseWidth);
-        MoveToEx(dc, left + mouseWidth / 2, top + 3, nullptr);
-        LineTo(dc, left + mouseWidth / 2, top + mouseHeight / 2);
-        SelectObject(dc, oldBrush);
-        SelectObject(dc, oldPen);
-        DeleteObject(pen);
-        DeleteObject(background);
-
-        wchar_t label[8] = L"—";
-        if (displayed >= 0) std::swprintf(label, 8, L"%d%%", displayed % 101);
-        HFONT font = CreateFontW(-MulDiv(15, h, 30), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
-                                 FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                 ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HGDIOBJ oldFont = SelectObject(dc, font);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, displayed >= 101 && !displayedStale ? RGB(145, 234, 184) : foreground);
-        area.left = left + mouseWidth + MulDiv(5, h, 30);
-        DrawTextW(dc, label, -1, &area, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
-        SelectObject(dc, oldFont);
-        DeleteObject(font);
-        EndPaint(window, &paint);
         return 0;
     }
     if (message == WM_CLOSE) {
@@ -315,24 +377,11 @@ struct Taskbar {
     }
 };
 
-bool CoversMonitor(const Taskbar& taskbar) {
-    const HWND foreground = GetForegroundWindow();
-    if (!foreground || foreground == taskbar.window || IsZoomed(foreground)) return false;
-    wchar_t name[32]{};
-    GetClassNameW(foreground, name, 32);
-    if (wcscmp(name, L"Progman") == 0 || wcscmp(name, L"WorkerW") == 0) return false;
-    RECT bounds{};
-    const RECT& screen = taskbar.monitor.rcMonitor;
-    return GetWindowRect(foreground, &bounds) && bounds.left <= screen.left &&
-           bounds.top <= screen.top && bounds.right >= screen.right && bounds.bottom >= screen.bottom;
-}
-
-void UpdateWidget() {
+void UpdateWidget(HINSTANCE instance) {
     Taskbar taskbar;
     RECT visible{};
     if (!taskbar.Read() ||
-        !IntersectRect(&visible, &taskbar.bounds, &taskbar.monitor.rcMonitor) ||
-        CoversMonitor(taskbar)) {
+        !IntersectRect(&visible, &taskbar.bounds, &taskbar.monitor.rcMonitor)) {
         ShowWindow(widget, SW_HIDE);
         return;
     }
@@ -342,7 +391,7 @@ void UpdateWidget() {
     const HWND bar = taskbar.window;
     const UINT dpi = GetDpiForWindow(bar);
     const int height = std::min<int>(MulDiv(30, dpi, 96), bounds.bottom - bounds.top);
-    const int width = std::min<int>(MulDiv(69, dpi, 96), bounds.right - bounds.left);
+    const int width = std::min<int>(MulDiv(56, dpi, 96), bounds.right - bounds.left);
     const int gap = MulDiv(4, dpi, 96);
     const LONG x = vertical ? bounds.left + (bounds.right - bounds.left - width) / 2
                             : notification.left - width - gap;
@@ -353,20 +402,41 @@ void UpdateWidget() {
         ShowWindow(widget, SW_HIDE);
         return;
     }
+    const bool recreate = !IsWindow(widget) || GetParent(widget) != bar;
+    if (recreate) {
+        if (IsWindow(widget)) DestroyWindow(widget);
+        const auto previousDpi = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(bar));
+        widget = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_NOPARENTNOTIFY,
+                                 WidgetClass, L"Rapoo VT2 MAX", WS_CHILD | WS_CLIPSIBLINGS,
+                                 0, 0, width, height, bar, nullptr, instance, nullptr);
+        if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
+        if (!widget) return;
+    }
+
     const RECT target{x, y, x + width, y + height};
     RECT current{};
-    const POINT center{x + width / 2, y + height / 2};
-    const HWND hit = WindowFromPoint(center);
-    if (!IsWindowVisible(widget) || !GetWindowRect(widget, &current) ||
-        !EqualRect(&current, &target) || GetAncestor(hit, GA_ROOT) == bar)
-        SetWindowPos(widget, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    GetWindowRect(widget, &current);
+    const bool moved = !EqualRect(&current, &target);
+    const bool shown = IsWindowVisible(widget);
+    if (moved || !shown) {
+        POINT position{x, y};
+        MapWindowPoints(nullptr, bar, &position, 1);
+        SetWindowPos(widget, HWND_TOP, position.x, position.y, width, height, SWP_NOACTIVATE);
+    }
 
     const int value = reading;
     const bool stale = value >= 0 && GetTickCount64() > lastReport.load() + 60000;
-    if (value != displayed || stale != displayedStale) {
+    const COLORREF color = TaskbarTextColor();
+    static COLORREF paintedColor = CLR_INVALID;
+    static UINT paintedDpi = 0;
+    if (recreate || !shown || moved || value != displayed || stale != displayedStale ||
+        color != paintedColor || dpi != paintedDpi) {
+        if (!PaintWidget(width, height, dpi, value, stale, color)) return;
         displayed = value;
         displayedStale = stale;
-        InvalidateRect(widget, nullptr, FALSE);
+        paintedColor = color;
+        paintedDpi = dpi;
+        if (!shown) ShowWindow(widget, SW_SHOWNOACTIVATE);
     }
 }
 
@@ -394,7 +464,7 @@ void LogTaskbar() {
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_TIMER && wparam == WidgetTimer) {
-        UpdateWidget();
+        UpdateWidget(reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window, GWLP_HINSTANCE)));
         return 0;
     }
     return DefWindowProcW(window, message, wparam, lparam);
@@ -480,15 +550,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     HWND window = CreateWindowExW(WS_EX_TOOLWINDOW, type.lpszClassName, L"Rapoo VT2 MAX",
                                   WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
-    widget = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-                             WidgetClass, L"Rapoo VT2 MAX", WS_POPUP, 0, 0, 1, 1,
-                             window, nullptr, instance, nullptr);
-    if (!widget || !SetTimer(window, WidgetTimer, 250, nullptr)) {
+    if (!SetTimer(window, WidgetTimer, 250, nullptr)) {
         MessageBoxW(nullptr, L"Не удалось запустить виджет панели задач.", L"Rapoo VT2 MAX",
                     MB_OK | MB_ICONERROR);
         return 1;
     }
-    UpdateWidget();
+    UpdateWidget(instance);
     std::thread worker(Monitor);
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
