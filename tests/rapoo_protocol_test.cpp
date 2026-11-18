@@ -15,6 +15,41 @@ int main() {
     assert(b.percent == 25 && !b.charging && b.mousePid == 0x4617);
     assert(b.connection == Rapoo::Connection::Receiver);
 
+    // The dongle can prefix the Nordic payload with its child-status marker.
+    auto wrapped = captured;
+    wrapped.insert(wrapped.begin() + 1, 0xB0);
+    assert(Rapoo::DecodeVT2MaxReceiver(captured.data(), captured.size(), b));
+    assert(Rapoo::DecodeVT2MaxReceiver(wrapped.data(), wrapped.size(), b));
+    assert(b.percent == 25 && !b.charging && b.mousePid == 0x4617);
+    assert(!Rapoo::DecodeVT2MaxReceiver(wrapped.data(), 9, b));
+    wrapped[2] = 0x22;
+    assert(!Rapoo::DecodeVT2MaxReceiver(wrapped.data(), wrapped.size(), b));
+
+    // Paired captures on VT2 MAX firmware 1.18, over 2.4 GHz and while charging.
+    auto vt2Max = std::vector<std::uint8_t>{
+        0x07, 0x20, 0x02, 0xB0, 0x04, 0xB0, 0x04, 0x00, 0x30, 0x00,
+        0x03, 0x84, 0x00, 0x23, 0x46, 0x00, 0x02, 0x03, 0xB8
+    };
+    const std::vector<std::uint8_t> vt2MaxCable = {
+        0x07, 0x22, 0x02, 0xB0, 0x04, 0xB0, 0x04, 0x02, 0x30, 0x00,
+        0x03, 0x84, 0x00, 0x23, 0x46, 0x00, 0x02, 0x03, 0x00
+    };
+    assert(Rapoo::DecodeBattery(vt2MaxCable.data(), vt2MaxCable.size(), b));
+    assert(b.percent == 48 && b.charging && b.connection == Rapoo::Connection::Cable);
+    assert(!Rapoo::DecodeVT2MaxReceiver(vt2MaxCable.data(), vt2MaxCable.size(), b));
+    assert(!Rapoo::DecodeBattery(vt2Max.data(), vt2Max.size(), b));
+    assert(Rapoo::DecodeVT2MaxReceiver(vt2Max.data(), vt2Max.size(), b));
+    assert(b.percent == 48 && !b.charging && b.mousePid == 0x4623 &&
+           b.connection == Rapoo::Connection::Receiver);
+    assert(!Rapoo::DecodeVT2MaxReceiver(vt2Max.data(), 18, b));
+    vt2Max[8] = 0;
+    assert(!Rapoo::DecodeVT2MaxReceiver(vt2Max.data(), vt2Max.size(), b));
+    vt2Max[8] = 101;
+    assert(!Rapoo::DecodeVT2MaxReceiver(vt2Max.data(), vt2Max.size(), b));
+    vt2Max[8] = 48;
+    vt2Max[13] = 0x17;
+    assert(!Rapoo::DecodeVT2MaxReceiver(vt2Max.data(), vt2Max.size(), b));
+
     // Also captured live after connecting the cable (before its percentage increased).
     const std::vector<std::uint8_t> capturedCable = {
         0x07, 0x22, 0x03, 0x20, 0x03, 0x20, 0x03, 0x02, 0x19, 0x00,
