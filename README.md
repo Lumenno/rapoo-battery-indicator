@@ -1,5 +1,7 @@
 # Rapoo VT2 MAX Battery Tray
 
+[Download the portable EXE for Windows x64](https://github.com/Lumenno/rapoo-battery-indicator/raw/refs/heads/main/bin/Rapoo-VT2-Max-Battery.exe)
+
 Portable Windows 10/11 x64 utility for the Rapoo VT2 MAX 2.4 GHz receiver
 (USB ID 24AE:1423). The widget shows a mouse glyph and percentage on the
 primary taskbar, beside the notification area. A dash indicates that the
