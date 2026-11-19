@@ -19,6 +19,7 @@ extern "C" {
 #include <string>
 #include <thread>
 #include <vector>
+#include "drivers/ardor_protocol.h"
 #include "drivers/rapoo_protocol.h"
 
 namespace {
@@ -30,6 +31,8 @@ constexpr UINT_PTR WidgetTimer = 1;
 constexpr DWORD DiagnosticDuration = 120000;
 std::atomic<int> reading{Disconnected};
 std::atomic<ULONGLONG> lastReport{0};
+std::atomic<int> ardorReading{Disconnected};
+std::atomic<ULONGLONG> lastArdorReport{0};
 HANDLE stopEvent;
 HWND widget;
 std::atomic<DWORD> inputLength{0};
@@ -40,6 +43,7 @@ std::atomic<unsigned> lastStatusBytes{0};
 std::atomic<DWORD> readError{0};
 int displayed = -3;
 bool displayedStale;
+bool displayedArdor;
 std::atomic<unsigned> acceptedCount{0};
 FILE* diagnosticLog;
 std::mutex logMutex;
@@ -57,11 +61,11 @@ void Log(const char* format, ...) {
     std::fflush(diagnosticLog);
 }
 
-bool GetReceiverCaps(HANDLE device, HIDP_CAPS& caps) {
+bool GetDeviceCaps(HANDLE device, USHORT vendor, USHORT product, HIDP_CAPS& caps) {
     HIDD_ATTRIBUTES ids{};
     ids.Size = sizeof(ids);
-    if (!HidD_GetAttributes(device, &ids) || ids.VendorID != 0x24AE ||
-        ids.ProductID != 0x1423) return false;
+    if (!HidD_GetAttributes(device, &ids) || ids.VendorID != vendor ||
+        ids.ProductID != product) return false;
 
     PHIDP_PREPARSED_DATA descriptor = nullptr;
     if (!HidD_GetPreparsedData(device, &descriptor)) {
@@ -74,16 +78,16 @@ bool GetReceiverCaps(HANDLE device, HIDP_CAPS& caps) {
     return status == HIDP_STATUS_SUCCESS;
 }
 
-HANDLE OpenReceiver(DWORD& reportSize) {
+template <typename Visitor>
+void EnumerateHid(Visitor visit) {
     GUID hid;
     HidD_GetHidGuid(&hid);
     HDEVINFO devices = SetupDiGetClassDevsW(&hid, nullptr, nullptr,
                                            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (devices == INVALID_HANDLE_VALUE) {
         Log("SetupDiGetClassDevs failed: %lu", GetLastError());
-        return INVALID_HANDLE_VALUE;
+        return;
     }
-    HANDLE receiver = INVALID_HANDLE_VALUE;
     SP_DEVICE_INTERFACE_DATA item{};
     item.cbSize = sizeof(item);
     for (DWORD index = 0; SetupDiEnumDeviceInterfaces(devices, nullptr, &hid, index, &item); ++index) {
@@ -98,63 +102,75 @@ HANDLE OpenReceiver(DWORD& reportSize) {
         std::transform(path.begin(), path.end(), path.begin(), [](wchar_t ch) {
             return static_cast<wchar_t>(std::towlower(ch));
         });
-        if (path.find(L"hid#vid_24ae&pid_1423&") == std::wstring::npos) continue;
+        if (!visit(index, detail->DevicePath, path)) break;
+    }
+    SetupDiDestroyDeviceInfoList(devices);
+}
 
-        constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
-        HANDLE metadata = CreateFileW(detail->DevicePath, 0, share, nullptr,
-                                      OPEN_EXISTING, 0, nullptr);
+constexpr DWORD HidShare = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+HANDLE OpenReceiver(DWORD& reportSize) {
+    HANDLE receiver = INVALID_HANDLE_VALUE;
+    EnumerateHid([&](DWORD index, const wchar_t* devicePath, const std::wstring& path) {
+        if (path.find(L"hid#vid_24ae&pid_1423&") == std::wstring::npos) return true;
+        HANDLE metadata = CreateFileW(devicePath, 0, HidShare, nullptr, OPEN_EXISTING, 0, nullptr);
         if (metadata == INVALID_HANDLE_VALUE) {
             Log("collection #%lu metadata open failed: %lu", index, GetLastError());
-            continue;
+            return true;
         }
         HIDP_CAPS caps{};
-        const bool valid = GetReceiverCaps(metadata, caps);
+        const bool valid = GetDeviceCaps(metadata, 0x24AE, 0x1423, caps);
         CloseHandle(metadata);
-        if (!valid) continue;
+        if (!valid) return true;
         Log("collection #%lu usage=%04X:%04X input=%u output=%u feature=%u", index,
             caps.UsagePage, caps.Usage, caps.InputReportByteLength,
             caps.OutputReportByteLength, caps.FeatureReportByteLength);
         if (receiver != INVALID_HANDLE_VALUE || caps.UsagePage != 0xFF00 ||
-            caps.Usage != 0x0002 || caps.InputReportByteLength == 0) continue;
-        receiver = CreateFileW(detail->DevicePath, GENERIC_READ, share, nullptr,
+            caps.Usage != 0x0002 || caps.InputReportByteLength == 0) return true;
+        receiver = CreateFileW(devicePath, GENERIC_READ, HidShare, nullptr,
                                OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
         if (receiver == INVALID_HANDLE_VALUE) {
             Log("collection #%lu read open failed: %lu", index, GetLastError());
-            continue;
+            return true;
         }
         reportSize = caps.InputReportByteLength;
         Log("collection #%lu opened for passive reads", index);
-        if (!diagnosticLog) break;
-    }
-    SetupDiDestroyDeviceInfoList(devices);
+        return diagnosticLog != nullptr;
+    });
     return receiver;
+}
+
+DWORD ReadInput(HANDLE device, BYTE* report, DWORD size, HANDLE completed,
+                DWORD timeout, DWORD& received) {
+    ResetEvent(completed);
+    OVERLAPPED operation{};
+    operation.hEvent = completed;
+    if (ReadFile(device, report, size, &received, &operation)) return ERROR_SUCCESS;
+    const DWORD error = GetLastError();
+    if (error != ERROR_IO_PENDING) return error;
+    HANDLE events[] = {stopEvent, completed};
+    const DWORD wait = WaitForMultipleObjects(2, events, FALSE, timeout);
+    if (wait == WAIT_OBJECT_0 + 1) {
+        return GetOverlappedResult(device, &operation, &received, FALSE)
+            ? ERROR_SUCCESS : GetLastError();
+    }
+    const DWORD waitError = wait == WAIT_FAILED ? GetLastError() : ERROR_OPERATION_ABORTED;
+    CancelIoEx(device, &operation);
+    GetOverlappedResult(device, &operation, &received, TRUE);
+    return wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : waitError;
 }
 
 void ReadReceiver(HANDLE receiver, DWORD reportSize, HANDLE completed) {
     std::vector<BYTE> report(reportSize);
-    HANDLE events[] = {stopEvent, completed};
     while (WaitForSingleObject(stopEvent, 0) == WAIT_TIMEOUT) {
-        ResetEvent(completed);
-        OVERLAPPED operation{};
-        operation.hEvent = completed;
         DWORD received = 0;
-        if (!ReadFile(receiver, report.data(), reportSize, &received, &operation)) {
-            const DWORD error = GetLastError();
-            if (error != ERROR_IO_PENDING) {
+        const DWORD error = ReadInput(receiver, report.data(), reportSize, completed, INFINITE, received);
+        if (error != ERROR_SUCCESS) {
+            if (WaitForSingleObject(stopEvent, 0) == WAIT_TIMEOUT) {
                 readError = error;
                 Log("ReadFile failed: %lu", error);
-                break;
             }
-            if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) {
-                CancelIoEx(receiver, &operation);
-                GetOverlappedResult(receiver, &operation, &received, TRUE);
-                break;
-            }
-            if (!GetOverlappedResult(receiver, &operation, &received, FALSE)) {
-                readError = GetLastError();
-                Log("GetOverlappedResult failed: %lu", readError.load());
-                break;
-            }
+            break;
         }
         if (!received) {
             Log("ReadFile returned an empty report");
@@ -213,12 +229,122 @@ void Monitor() {
     CloseHandle(completed);
 }
 
+struct ArdorEndpoints {
+    std::wstring input;
+    std::wstring feature;
+    bool ambiguous = false;
+
+    void Add(std::wstring& endpoint, const wchar_t* path) {
+        ambiguous |= !endpoint.empty();
+        endpoint = path;
+    }
+
+    bool Ready() const {
+        return !ambiguous && !input.empty() && !feature.empty();
+    }
+};
+
+bool ReadArdor(const ArdorEndpoints& endpoints, HANDLE completed, int& value) {
+    if (!endpoints.Ready()) return false;
+    const HANDLE input = CreateFileW(endpoints.input.c_str(), GENERIC_READ, HidShare, nullptr,
+                                     OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    if (input == INVALID_HANDLE_VALUE) {
+        Log("ARDOR input open failed: %lu", GetLastError());
+        return false;
+    }
+    const HANDLE feature = CreateFileW(endpoints.feature.c_str(), GENERIC_WRITE, HidShare, nullptr,
+                                       OPEN_EXISTING, 0, nullptr);
+    if (feature == INVALID_HANDLE_VALUE) {
+        Log("ARDOR feature open failed: %lu", GetLastError());
+        CloseHandle(input);
+        return false;
+    }
+    auto request = Ardor::BatteryQuery;
+    const bool sent = HidD_SetFeature(feature, request.data(), request.size());
+    if (!sent) Log("ARDOR battery query failed: %lu", GetLastError());
+    CloseHandle(feature);
+
+    const ULONGLONG deadline = GetTickCount64() + 800;
+    for (ULONGLONG now = GetTickCount64(); sent && now < deadline; now = GetTickCount64()) {
+        BYTE response[Ardor::ReportSize]{};
+        DWORD received = 0;
+        const DWORD error = ReadInput(input, response, sizeof(response), completed,
+                                      static_cast<DWORD>(deadline - now), received);
+        if (error != ERROR_SUCCESS || !received) {
+            Log("ARDOR battery response unavailable: %lu", error);
+            break;
+        }
+        int percent = 0;
+        bool charging = false;
+        const bool accepted = Ardor::DecodeBattery(response, received, percent, charging);
+        Log("ARDOR input id=%02X length=%lu %s", response[0], received, accepted ? "accepted" : "ignored");
+        if (accepted) {
+            value = percent + (charging ? 101 : 0);
+            Log("ARDOR battery=%d%% charging=%d", percent, charging);
+            CloseHandle(input);
+            return true;
+        }
+    }
+    CloseHandle(input);
+    return false;
+}
+
+void MonitorArdor() {
+    const HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!completed) return;
+    DWORD interval = 2000;
+    do {
+        ArdorEndpoints cable, receiver;
+        bool present = false;
+        EnumerateHid([&](DWORD index, const wchar_t* devicePath, const std::wstring& path) {
+            const bool wired = path.find(L"hid#vid_25a7&pid_fa7b&") != std::wstring::npos;
+            if (!wired && path.find(L"hid#vid_25a7&pid_fa7c&") == std::wstring::npos) return true;
+            present = true;
+            const USHORT product = wired ? Ardor::Cable : Ardor::Receiver;
+            const HANDLE metadata = CreateFileW(devicePath, 0, HidShare, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (metadata == INVALID_HANDLE_VALUE) {
+                Log("ARDOR %04X collection #%lu metadata open failed: %lu", product, index, GetLastError());
+                return true;
+            }
+            HIDP_CAPS caps{};
+            const bool valid = GetDeviceCaps(metadata, Ardor::Vendor, product, caps);
+            CloseHandle(metadata);
+            if (!valid) return true;
+            Log("ARDOR %04X collection #%lu usage=%04X:%04X input=%u feature=%u", product, index,
+                caps.UsagePage, caps.Usage, caps.InputReportByteLength, caps.FeatureReportByteLength);
+            auto& endpoints = wired ? cable : receiver;
+            if (caps.UsagePage == 0xFF01 && caps.InputReportByteLength == Ardor::ReportSize)
+                endpoints.Add(endpoints.input, devicePath);
+            if (caps.UsagePage == 0xFF02 && caps.FeatureReportByteLength == Ardor::ReportSize)
+                endpoints.Add(endpoints.feature, devicePath);
+            return true;
+        });
+        interval = present ? 30000 : 2000;
+        if (!present) {
+            ardorReading = Disconnected;
+            continue;
+        }
+        if (ardorReading == Disconnected) ardorReading = Waiting;
+        int value = Waiting;
+        if (ReadArdor(cable, completed, value) || ReadArdor(receiver, completed, value)) {
+            lastArdorReport = GetTickCount64();
+            ardorReading = value;
+        } else if (GetTickCount64() - lastArdorReport.load() > 60000) {
+            ardorReading = Waiting;
+        }
+    } while (WaitForSingleObject(stopEvent, interval) == WAIT_TIMEOUT);
+    CloseHandle(completed);
+}
+
 void CopyDiagnostics(HWND window) {
-    wchar_t text[350];
-    std::swprintf(text, 350, L"Rapoo VT2 MAX 24AE:1423 | input=%lu | reports=%u | "
-                  L"last ID=%02X | status 07=%u | accepted=%u | mode/state/level=%06X | read error=%lu",
+    wchar_t text[420];
+    const int ardor = ardorReading;
+    std::swprintf(text, 420, L"Rapoo VT2 MAX 24AE:1423 | input=%lu | reports=%u | "
+                  L"last ID=%02X | status 07=%u | accepted=%u | mode/state/level=%06X | read error=%lu | "
+                  L"ARDOR CompX 25A7:FA7B/FA7C | reading=%d",
                   inputLength.load(), reportCount.load(), lastReportId.load(),
-                  statusCount.load(), acceptedCount.load(), lastStatusBytes.load(), readError.load());
+                  statusCount.load(), acceptedCount.load(), lastStatusBytes.load(), readError.load(),
+                  ardor >= 0 ? ardor % 101 : ardor);
     const SIZE_T bytes = (wcslen(text) + 1) * sizeof(wchar_t);
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
     if (!memory) return;
@@ -340,11 +466,13 @@ LRESULT CALLBACK WidgetProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         POINT point{};
         GetCursorPos(&point);
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, displayed == Disconnected
-                    ? L"Rapoo VT2 MAX — приёмник не найден" : displayed == Waiting
-                    ? L"Rapoo VT2 MAX — ожидание данных" : displayedStale
-                    ? L"Rapoo VT2 MAX — последнее показание" : displayed >= 101
-                    ? L"Rapoo VT2 MAX — заряжается" : L"Rapoo VT2 MAX");
+        const wchar_t* name = displayedArdor ? L"ARDOR CompX" : L"Rapoo VT2 MAX";
+        const wchar_t* status = displayed == Disconnected ? L" — мышь не найдена" :
+                                displayed == Waiting ? L" — ожидание данных" :
+                                displayedStale ? L" — последнее показание" :
+                                displayed >= 101 ? L" — заряжается" : L"";
+        const auto title = std::wstring(name) + status;
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, title.c_str());
         AppendMenuW(menu, MF_STRING, 1, L"Копировать диагностику");
         AppendMenuW(menu, MF_STRING, 2, L"Выход");
         SetForegroundWindow(window);
@@ -424,16 +552,25 @@ void UpdateWidget(HINSTANCE instance) {
         SetWindowPos(widget, HWND_TOP, position.x, position.y, width, height, SWP_NOACTIVATE);
     }
 
-    const int value = reading;
-    const bool stale = value >= 0 && GetTickCount64() > lastReport.load() + 60000;
+    const int rapoo = reading;
+    const int ardor = ardorReading;
+    const auto now = GetTickCount64();
+    const bool rapooStale = rapoo >= 0 && now > lastReport.load() + 60000;
+    const bool useArdor = ardor != Disconnected &&
+                          (rapoo == Disconnected || (ardor >= 0 && (rapoo < 0 || rapooStale)));
+    const int value = useArdor ? ardor : rapoo;
+    const bool stale = useArdor ? ardor >= 0 && now > lastArdorReport.load() + 60000 : rapooStale;
     const COLORREF color = TaskbarTextColor();
     static COLORREF paintedColor = CLR_INVALID;
     static UINT paintedDpi = 0;
     if (recreate || !shown || moved || value != displayed || stale != displayedStale ||
+        useArdor != displayedArdor ||
         color != paintedColor || dpi != paintedDpi) {
         if (!PaintWidget(width, height, dpi, value, stale, color)) return;
         displayed = value;
         displayedStale = stale;
+        displayedArdor = useArdor;
+        SetWindowTextW(widget, useArdor ? L"ARDOR CompX" : L"Rapoo VT2 MAX");
         paintedColor = color;
         paintedDpi = dpi;
         if (!shown) ShowWindow(widget, SW_SHOWNOACTIVATE);
@@ -477,7 +614,8 @@ int Diagnose(const wchar_t* path) {
         return 1;
     }
     diagnosticStart = GetTickCount64();
-    Log("Rapoo VT2 MAX 24AE:1423 passive capture, %lu seconds", DiagnosticDuration / 1000);
+    Log("Battery diagnostic, %lu seconds: Rapoo VT2 MAX 24AE:1423 and ARDOR CompX 25A7:FA7B/FA7C",
+        DiagnosticDuration / 1000);
     HANDLE running = OpenMutexW(SYNCHRONIZE, FALSE, MutexName);
     const DWORD mutexError = running ? ERROR_SUCCESS : GetLastError();
     Log("widget mutex present=%d error=%lu", running != nullptr, mutexError);
@@ -485,6 +623,7 @@ int Diagnose(const wchar_t* path) {
     LogTaskbar();
 
     std::thread worker(Monitor);
+    std::thread ardorWorker(MonitorArdor);
     for (DWORD elapsed = 0; elapsed < DiagnosticDuration; elapsed += 10000) {
         Sleep(10000);
         Log("totals reports=%u id07=%u accepted=%u", reportCount.load(), statusCount.load(),
@@ -493,6 +632,7 @@ int Diagnose(const wchar_t* path) {
     }
     SetEvent(stopEvent);
     worker.join();
+    ardorWorker.join();
     Log("final totals reports=%u id07=%u accepted=%u", reportCount.load(), statusCount.load(),
         acceptedCount.load());
     Log("capture finished");
@@ -557,6 +697,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     UpdateWidget(instance);
     std::thread worker(Monitor);
+    std::thread ardorWorker(MonitorArdor);
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         TranslateMessage(&message);
@@ -566,6 +707,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     DestroyWindow(window);
     SetEvent(stopEvent);
     worker.join();
+    ardorWorker.join();
     CloseHandle(stopEvent);
     CloseHandle(singleton);
     return 0;

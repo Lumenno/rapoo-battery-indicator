@@ -1,10 +1,38 @@
 #include "../src/drivers/rapoo_protocol.h"
+#include "../src/drivers/ardor_protocol.h"
 
 #include <cassert>
 #include <cstdio>
 #include <vector>
 
 int main() {
+    // Synthetic CompX reply with 72% and the charging flag set.
+    std::array<std::uint8_t, Ardor::ReportSize> reply{0x09, 0x04, 0, 0, 0, 0, 72, 1};
+    const auto checksum = [](auto& report) {
+        unsigned sum = 0;
+        for (std::size_t i = 0; i + 1 < report.size(); ++i) sum += report[i];
+        report.back() = static_cast<std::uint8_t>(0x55U - sum);
+    };
+    checksum(reply);
+    int percent = -1;
+    bool charging = false;
+    assert(Ardor::DecodeBattery(reply.data(), reply.size(), percent, charging));
+    assert(percent == 72 && charging);
+    assert(!Ardor::DecodeBattery(reply.data(), reply.size() - 1, percent, charging));
+    ++reply[16];
+    assert(!Ardor::DecodeBattery(reply.data(), reply.size(), percent, charging));
+    reply[6] = 101;
+    checksum(reply);
+    assert(!Ardor::DecodeBattery(reply.data(), reply.size(), percent, charging));
+    reply[6] = 0;
+    reply[7] = 0;
+    checksum(reply);
+    assert(Ardor::DecodeBattery(reply.data(), reply.size(), percent, charging));
+    assert(percent == 0 && !charging);
+    reply[1] = 0x05;
+    checksum(reply);
+    assert(!Ardor::DecodeBattery(reply.data(), reply.size(), percent, charging));
+
     // Captured on the user's VT3 Max Gen 2, receiver 24AE:1417, FF00:0002.
     const std::vector<std::uint8_t> captured = {
         0x07, 0x20, 0x03, 0x20, 0x03, 0x20, 0x03, 0x01, 0x19, 0x00,
